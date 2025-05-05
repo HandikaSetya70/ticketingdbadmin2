@@ -1,17 +1,24 @@
 {
-  "name": "dbstuffadmin2",
+  "name": "ticketing-system-api-admin-2",
   "version": "1.0.0",
-  "main": "index.js",
+  "type":"module",
+  "description": "Backend API for ticketing system with blockchain revocation",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "vercel dev",
+    "deploy": "vercel deploy",
+    "deploy:prod": "vercel deploy --prod"
   },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4"
+  },
+  "devDependencies": {
+    "vercel": "^32.0.0"
+  },
+  "engines": {
+    "node": ">=16.x"
+  },
+  "main": "index.js",
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.5.0",
-    "express": "^5.1.0"
-  }
+  "license": "ISC"
 }
