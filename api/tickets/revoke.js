@@ -93,7 +93,9 @@ export default async function handler(req, res) {
       })
     }
 
-    // Update ticket status
+    // Start database transaction (we'll use supabase functions one after another)
+    
+    // 1. Update ticket status
     const { data: updatedTicket, error: updateError } = await supabase
       .from('tickets')
       .update({ ticket_status: 'revoked' })
@@ -105,13 +107,18 @@ export default async function handler(req, res) {
       throw updateError
     }
 
-    // Create revocation log
+    // 2. Create revocation log entry with enhanced fields
+    const blockchainStatus = (ticket.nft_contract_address && ticket.nft_token_id) ? 'pending' : 'not_applicable';
+    
     const { data: logEntry, error: logError } = await supabase
       .from('revocation_log')
       .insert([{
         ticket_id,
         admin_id: adminUser.user_id,
-        reason
+        reason,
+        blockchain_status: blockchainStatus,
+        blockchain_tx_hash: null,
+        revocation_proof: null
       }])
       .select()
       .single()
@@ -121,12 +128,83 @@ export default async function handler(req, res) {
       // Don't throw error here as the ticket was already revoked
     }
 
+    // 3. If ticket has blockchain info, add to blockchain revocation queue
+    let queueEntry = null;
+    if (blockchainStatus === 'pending' && logEntry) {
+      const { data: queueData, error: queueError } = await supabase
+        .from('blockchain_revocation_queue')
+        .insert([{
+          ticket_id,
+          revocation_log_id: logEntry.id,
+          status: 'pending'
+        }])
+        .select()
+        .single()
+
+      if (queueError) {
+        console.error('Error adding to blockchain queue:', queueError)
+        // Don't throw error here as the database revocation worked
+      } else {
+        queueEntry = queueData;
+      }
+    }
+
+    // Determine if we need to handle revocation of related tickets
+    let groupTickets = [];
+    if (ticket.is_parent_ticket && ticket.total_tickets_in_group > 1) {
+      // This is a parent ticket, revoke all child tickets
+      const { data: childTickets, error: childError } = await supabase
+        .from('tickets')
+        .select('ticket_id')
+        .eq('parent_ticket_id', ticket_id)
+        .eq('ticket_status', 'valid')
+      
+      if (!childError && childTickets && childTickets.length > 0) {
+        // Update all child tickets
+        const { data: updatedChildren, error: updateChildrenError } = await supabase
+          .from('tickets')
+          .update({ ticket_status: 'revoked' })
+          .in('ticket_id', childTickets.map(t => t.ticket_id))
+          .select()
+        
+        if (!updateChildrenError) {
+          groupTickets = updatedChildren;
+          
+          // Log revocation for each child ticket
+          const childLogEntries = childTickets.map(childTicket => ({
+            ticket_id: childTicket.ticket_id,
+            admin_id: adminUser.user_id,
+            reason: `Revoked as part of group. Parent ticket ${ticket_id} was revoked. Reason: ${reason}`,
+            blockchain_status: 'not_applicable'
+          }));
+          
+          const { data: childLogs, error: childLogError } = await supabase
+            .from('revocation_log')
+            .insert(childLogEntries)
+            .select();
+            
+          if (childLogError) {
+            console.error('Error logging child revocations:', childLogError);
+          }
+        }
+      }
+    } else if (ticket.parent_ticket_id) {
+      // This is a child ticket, we might want to update the parent to reflect the status change
+      // For now, we won't automatically revoke the parent, but we could add that logic here
+    }
+
     return res.status(200).json({
       status: 'success',
       message: 'Ticket revoked successfully',
       data: {
         ticket: updatedTicket,
-        revocation_log: logEntry
+        revocation_log: logEntry,
+        blockchain_status: blockchainStatus,
+        blockchain_queue: queueEntry,
+        group_tickets: groupTickets.length > 0 ? {
+          count: groupTickets.length,
+          revoked: groupTickets.length
+        } : null
       }
     })
 

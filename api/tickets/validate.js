@@ -61,29 +61,38 @@ export default async function handler(req, res) {
     }
 
     // Get the request data
-    const { ticket_id, user_id } = req.body
+    const { ticket_id, user_id, qr_code_hash } = req.body
 
-    // Validate required fields
-    if (!ticket_id || !user_id) {
+    // Validate required fields - allow either ticket_id or qr_code_hash
+    if ((!ticket_id && !qr_code_hash) || !user_id) {
       return res.status(400).json({
         status: 'error',
-        message: 'Missing required fields: ticket_id, user_id'
+        message: 'Missing required fields: either ticket_id or qr_code_hash, and user_id are required'
       })
     }
 
-    // Check if ticket exists and belongs to the user
-    const { data: ticket, error: ticketError } = await supabase
+    // Find the ticket using either ticket_id or qr_code_hash
+    let ticketQuery = supabase
       .from('tickets')
       .select(`
         *,
         events (
+          event_id,
           event_name,
           event_date,
-          venue
+          venue,
+          nft_contract_address,
+          blockchain_network
         )
-      `)
-      .eq('ticket_id', ticket_id)
-      .single()
+      `);
+    
+    if (ticket_id) {
+      ticketQuery = ticketQuery.eq('ticket_id', ticket_id);
+    } else {
+      ticketQuery = ticketQuery.eq('qr_code_hash', qr_code_hash);
+    }
+    
+    const { data: ticket, error: ticketError } = await ticketQuery.single();
 
     if (ticketError || !ticket) {
       return res.status(404).json({
@@ -100,16 +109,78 @@ export default async function handler(req, res) {
       })
     }
 
-    // Check ticket status
+    // Check ticket revocation status
     if (ticket.ticket_status === 'revoked') {
+      // Get revocation details
+      const { data: revocation, error: revocationError } = await supabase
+        .from('revocation_log')
+        .select(`
+          id,
+          reason,
+          revoked_at,
+          blockchain_status,
+          blockchain_tx_hash,
+          admin:admin_id (
+            user_id,
+            id_name,
+            role
+          )
+        `)
+        .eq('ticket_id', ticket.ticket_id)
+        .order('revoked_at', { ascending: false })
+        .limit(1)
+        .single();
+
       return res.status(403).json({
         status: 'error',
         message: 'Ticket has been revoked',
         data: {
           ticket_id: ticket.ticket_id,
-          status: ticket.ticket_status
+          status: ticket.ticket_status,
+          revocation_details: revocationError ? null : {
+            reason: revocation.reason,
+            revoked_at: revocation.revoked_at,
+            revoked_by: revocation.admin ? revocation.admin.id_name : 'Unknown',
+            blockchain_status: revocation.blockchain_status,
+            blockchain_tx_hash: revocation.blockchain_tx_hash
+          }
         }
       })
+    }
+
+    // Enhanced validation for NFT tickets
+    let blockchainStatus = 'not_applicable';
+    
+    if (ticket.nft_contract_address && ticket.nft_token_id) {
+      // In a complete implementation, we would check the blockchain here
+      // For now, we'll just report it as 'valid_on_database'
+      blockchainStatus = 'valid_on_database';
+      
+      // Check if there's a pending blockchain revocation
+      const { data: pendingRevocation, error: pendingError } = await supabase
+        .from('blockchain_revocation_queue')
+        .select('*')
+        .eq('ticket_id', ticket.ticket_id)
+        .eq('status', 'pending')
+        .limit(1);
+        
+      if (!pendingError && pendingRevocation && pendingRevocation.length > 0) {
+        blockchainStatus = 'pending_blockchain_revocation';
+      }
+      
+      // Here you would add actual blockchain verification
+      // const isRevokedOnChain = await checkBlockchainRevocationStatus(
+      //   ticket.nft_contract_address, 
+      //   ticket.nft_token_id,
+      //   ticket.events.blockchain_network
+      // );
+      // 
+      // if (isRevokedOnChain) {
+      //   blockchainStatus = 'revoked_on_chain';
+      //   // Update our database to match chain status
+      //   await syncRevocationFromBlockchain(ticket);
+      //   return res.status(403).json({...});
+      // }
     }
 
     // If ticket is part of a group, get group status
@@ -131,6 +202,23 @@ export default async function handler(req, res) {
       }
     }
 
+    // Log this validation check for audit purposes
+    // This is optional but helpful for tracking ticket usage
+    const { error: validationLogError } = await supabase
+      .from('ticket_validation_log')
+      .insert([{
+        ticket_id: ticket.ticket_id,
+        admin_id: adminUser.user_id,
+        validation_status: 'valid',
+        validation_method: ticket_id ? 'ticket_id' : 'qr_code'
+      }])
+      .select();
+      
+    if (validationLogError) {
+      console.error('Error logging validation:', validationLogError);
+      // Continue anyway, this is just for auditing
+    }
+
     return res.status(200).json({
       status: 'success',
       message: 'Ticket is valid',
@@ -144,7 +232,13 @@ export default async function handler(req, res) {
         qr_code_hash: ticket.qr_code_hash,
         ticket_number: ticket.ticket_number,
         total_tickets_in_group: ticket.total_tickets_in_group,
-        group_status: groupStatus
+        blockchain_status: blockchainStatus,
+        group_status: groupStatus,
+        nft_details: ticket.nft_contract_address ? {
+          contract_address: ticket.nft_contract_address,
+          token_id: ticket.nft_token_id,
+          network: ticket.events?.blockchain_network || 'sepolia'
+        } : null
       }
     })
 
