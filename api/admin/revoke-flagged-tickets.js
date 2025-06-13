@@ -111,9 +111,31 @@ export default async function handler(req, res) {
 
         const { data: ticketsToRevoke, error: ticketsError } = await supabase
             .from('tickets')
-            .select('*')
+            .select(`
+                ticket_id,
+                user_id,
+                event_id,
+                payment_id,
+                purchase_date,
+                ticket_status,
+                blockchain_ticket_id,
+                qr_code_hash,
+                qr_code_data,
+                qr_code_base64,
+                ticket_number,
+                total_tickets_in_group,
+                is_parent_ticket,
+                parent_ticket_id,
+                nft_contract_address,
+                nft_token_id::text as nft_token_id,
+                nft_mint_status,
+                nft_metadata,
+                blockchain_registered,
+                blockchain_tx_hash,
+                blockchain_error
+            `)
             .in('payment_id', paymentIds)
-            .eq('ticket_status', 'valid'); // Only revoke valid tickets
+            .eq('ticket_status', 'valid');
 
         if (ticketsError) {
             console.error('❌ Failed to retrieve tickets:', ticketsError);
