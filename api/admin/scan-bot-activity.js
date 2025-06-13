@@ -37,36 +37,28 @@ export default async function handler(req, res) {
         console.log('⏰ Time window:', time_window_minutes, 'minutes');
         console.log('🎭 Event filter:', event_id || 'All events');
 
-        // Build query for rapid purchases
-        let queryConditions = `
-            purchase_timestamp >= NOW() - INTERVAL '${time_window_minutes} minutes'
-            AND status = 'normal'
-        `;
+        // Calculate the time threshold
+        const timeThreshold = new Date();
+        timeThreshold.setMinutes(timeThreshold.getMinutes() - time_window_minutes);
+        const timeThresholdISO = timeThreshold.toISOString();
 
+        console.log('🕐 Scanning purchases since:', timeThresholdISO);
+
+        // Build base query for purchases in the time window
+        let query = supabase
+            .from('purchase_history')
+            .select('*')
+            .gte('purchase_timestamp', timeThresholdISO)
+            .eq('status', 'normal');
+
+        // Add event filter if specified
         if (event_id) {
-            queryConditions += ` AND event_id = '${event_id}'`;
+            query = query.eq('event_id', event_id);
         }
 
-        // Find users with multiple purchases in time window
-        const { data: rapidPurchases, error } = await supabase
-            .rpc('execute_raw_sql', {
-                query: `
-                    SELECT 
-                        user_id,
-                        COUNT(*) as purchase_count,
-                        array_agg(id) as purchase_ids,
-                        array_agg(event_id) as event_ids,
-                        array_agg(payment_id) as payment_ids,
-                        array_agg(quantity) as quantities,
-                        MIN(purchase_timestamp) as first_purchase,
-                        MAX(purchase_timestamp) as last_purchase
-                    FROM purchase_history 
-                    WHERE ${queryConditions}
-                    GROUP BY user_id
-                    HAVING COUNT(*) >= 2
-                    ORDER BY purchase_count DESC, MAX(purchase_timestamp) DESC
-                `
-            });
+        // Get all purchases in the time window
+        const { data: recentPurchases, error } = await query
+            .order('purchase_timestamp', { ascending: false });
 
         if (error) {
             console.error('Database error:', error);
@@ -77,15 +69,76 @@ export default async function handler(req, res) {
             });
         }
 
-        console.log(`🎯 Found ${rapidPurchases?.length || 0} users with rapid purchases`);
+        console.log(`📊 Found ${recentPurchases?.length || 0} purchases in time window`);
 
-        // Flag the suspicious purchases
+        if (!recentPurchases || recentPurchases.length === 0) {
+            return res.status(200).json({
+                status: 'success',
+                message: 'Scan completed. No purchases found in time window',
+                data: {
+                    scan_timestamp: new Date().toISOString(),
+                    time_window_minutes,
+                    event_filter: event_id || null,
+                    flagged_users_count: 0,
+                    flagged_purchases: []
+                }
+            });
+        }
+
+        // Group purchases by user_id and analyze patterns
+        const userPurchases = {};
+        
+        recentPurchases.forEach(purchase => {
+            const userId = purchase.user_id;
+            if (!userPurchases[userId]) {
+                userPurchases[userId] = [];
+            }
+            userPurchases[userId].push(purchase);
+        });
+
+        console.log(`👥 Analyzing ${Object.keys(userPurchases).length} unique users`);
+
+        // Find users with multiple purchases (suspicious activity)
+        const suspiciousUsers = [];
+        
+        Object.entries(userPurchases).forEach(([userId, purchases]) => {
+            if (purchases.length >= 2) {
+                // Calculate time span between first and last purchase
+                const timestamps = purchases.map(p => new Date(p.purchase_timestamp));
+                const firstPurchase = new Date(Math.min(...timestamps));
+                const lastPurchase = new Date(Math.max(...timestamps));
+                const timeSpanMinutes = (lastPurchase - firstPurchase) / (1000 * 60);
+                
+                // Calculate total tickets
+                const totalTickets = purchases.reduce((sum, p) => sum + p.quantity, 0);
+                
+                suspiciousUsers.push({
+                    user_id: userId,
+                    purchase_count: purchases.length,
+                    purchase_ids: purchases.map(p => p.id),
+                    event_ids: [...new Set(purchases.map(p => p.event_id))],
+                    payment_ids: purchases.map(p => p.payment_id),
+                    quantities: purchases.map(p => p.quantity),
+                    total_tickets: totalTickets,
+                    first_purchase: firstPurchase.toISOString(),
+                    last_purchase: lastPurchase.toISOString(),
+                    time_span_minutes: Math.round(timeSpanMinutes * 100) / 100,
+                    purchases: purchases
+                });
+                
+                console.log(`🚨 Suspicious user ${userId}: ${purchases.length} purchases, ${totalTickets} tickets, ${timeSpanMinutes.toFixed(1)} min span`);
+            }
+        });
+
+        console.log(`🎯 Found ${suspiciousUsers.length} users with rapid purchases`);
+
+        // Flag the suspicious purchases in the database
         const flaggedPurchases = [];
         
-        for (const userActivity of rapidPurchases || []) {
-            console.log(`🚨 Flagging user ${userActivity.user_id} with ${userActivity.purchase_count} rapid purchases`);
+        for (const userActivity of suspiciousUsers) {
+            console.log(`🏷️ Flagging ${userActivity.purchase_count} purchases for user ${userActivity.user_id}`);
             
-            // Flag all purchases for this user as suspicious
+            // Update all purchases for this user as flagged
             const { error: updateError } = await supabase
                 .from('purchase_history')
                 .update({ 
@@ -95,28 +148,25 @@ export default async function handler(req, res) {
                 .in('id', userActivity.purchase_ids);
 
             if (!updateError) {
-                const timeSpanMinutes = Math.round(
-                    (new Date(userActivity.last_purchase) - new Date(userActivity.first_purchase)) / 1000 / 60
-                );
-
                 flaggedPurchases.push({
                     user_id: userActivity.user_id,
                     purchase_count: userActivity.purchase_count,
-                    total_tickets: userActivity.quantities.reduce((sum, qty) => sum + qty, 0),
-                    time_span_minutes: timeSpanMinutes,
+                    total_tickets: userActivity.total_tickets,
+                    time_span_minutes: userActivity.time_span_minutes,
                     first_purchase: userActivity.first_purchase,
                     last_purchase: userActivity.last_purchase,
                     purchase_ids: userActivity.purchase_ids,
                     event_ids: userActivity.event_ids
                 });
 
-                console.log(`✅ Flagged ${userActivity.purchase_count} purchases for user ${userActivity.user_id}`);
+                console.log(`✅ Successfully flagged ${userActivity.purchase_count} purchases for user ${userActivity.user_id}`);
             } else {
                 console.error(`❌ Failed to flag purchases for user ${userActivity.user_id}:`, updateError);
             }
         }
 
         console.log('🎉 ============ BOT SCAN COMPLETE ============');
+        console.log(`📈 Results: ${flaggedPurchases.length} users flagged, ${flaggedPurchases.reduce((sum, u) => sum + u.purchase_count, 0)} purchases flagged`);
 
         return res.status(200).json({
             status: 'success',
@@ -126,7 +176,13 @@ export default async function handler(req, res) {
                 time_window_minutes,
                 event_filter: event_id || null,
                 flagged_users_count: flaggedPurchases.length,
-                flagged_purchases: flaggedPurchases
+                flagged_purchases: flaggedPurchases,
+                scan_details: {
+                    total_purchases_in_window: recentPurchases.length,
+                    unique_users_in_window: Object.keys(userPurchases).length,
+                    suspicious_users_found: suspiciousUsers.length,
+                    time_threshold: timeThresholdISO
+                }
             }
         });
 
