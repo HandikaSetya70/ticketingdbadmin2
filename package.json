@@ -9,6 +9,7 @@
     "deploy:prod": "vercel deploy --prod"
   },
   "dependencies": {
+    "ethers": "^5.7.2",
     "@supabase/supabase-js": "^2.49.4"
   },
   "devDependencies": {
