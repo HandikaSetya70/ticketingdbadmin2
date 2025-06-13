@@ -44,11 +44,31 @@ export default async function handler(req, res) {
                 message: 'Authorization token required' 
             });
         }
+        const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+        
+        if (authError || !user) {
+            return res.status(401).json({ 
+                status: 'error', 
+                message: 'Invalid authentication token' 
+            });
+        }
 
+        // 🆕 Look up admin's user_id in the users table
+        const { data: adminUser, error: adminError } = await supabase
+            .from('users')
+            .select('user_id, id_name, role')
+            .eq('auth_id', user.id)
+            .single();
+
+        if (adminError || !adminUser) {
+            return res.status(401).json({ 
+                status: 'error', 
+                message: 'Admin user not found' 
+            });
+        }
         const { 
             purchase_ids, 
             reason = 'Bot activity detected - rapid purchases',
-            admin_id = 'system-bot-detection'
         } = req.body;
 
         if (!purchase_ids || !Array.isArray(purchase_ids) || purchase_ids.length === 0) {
@@ -57,6 +77,7 @@ export default async function handler(req, res) {
                 message: 'purchase_ids array is required and cannot be empty' 
             });
         }
+        const admin_id = adminUser.user_id;
 
         console.log('🔨 ============ REVOKING FLAGGED TICKETS ============');
         console.log('📋 Purchase IDs to revoke:', purchase_ids);
