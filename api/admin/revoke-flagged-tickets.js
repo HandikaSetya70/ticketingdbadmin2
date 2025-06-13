@@ -215,7 +215,7 @@ export default async function handler(req, res) {
             try {
                 // Simple fix - clean string conversion
                 const tokenIds = blockchainTickets.map(t => {
-                    const cleanTokenId = t.nft_token_id.toString().trim();
+                    const tokenId = String(t.nft_token_id); // ✅ Direct string conversion
                     console.log('🧹 Clean token ID:', cleanTokenId);
                     return cleanTokenId;
                 });
