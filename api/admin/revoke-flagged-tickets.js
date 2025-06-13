@@ -213,7 +213,12 @@ export default async function handler(req, res) {
             console.log(`🔗 Attempting to revoke ${blockchainTickets.length} tickets on blockchain...`);
             
             try {
-                const tokenIds = blockchainTickets.map(t => t.nft_token_id);
+                // Simple fix - clean string conversion
+                const tokenIds = blockchainTickets.map(t => {
+                    const cleanTokenId = t.nft_token_id.toString().trim();
+                    console.log('🧹 Clean token ID:', cleanTokenId);
+                    return cleanTokenId;
+                });
                 console.log('🎫 Token IDs to revoke:', tokenIds);
                 
                 const blockchainResult = await revokeTicketsOnBlockchain(tokenIds);
