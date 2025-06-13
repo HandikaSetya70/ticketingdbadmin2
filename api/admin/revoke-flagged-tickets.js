@@ -196,9 +196,27 @@ export default async function handler(req, res) {
         console.log('⛓️ ============ BLOCKCHAIN REVOCATION ============');
         
         // Filter tickets that need blockchain revocation
-        const blockchainTickets = revokedTickets.filter(ticket => 
-            ticket.blockchain_registered && ticket.nft_token_id
-        );
+        const blockchainTickets = revokedTickets.filter(ticket => {
+            console.log(`🔍 Checking ticket ${ticket.ticket_id}:`);
+            console.log(`   ⛓️ blockchain_registered: ${ticket.blockchain_registered}`);
+            console.log(`   🎫 nft_token_id: ${ticket.nft_token_id} (type: ${typeof ticket.nft_token_id})`);
+            console.log(`   📝 Raw value: "${ticket.nft_token_id}"`);
+            
+            // Check if blockchain_registered is true
+            const isRegistered = ticket.blockchain_registered === true;
+            
+            // Check if nft_token_id exists (handles 0, "0", and other values)
+            const hasTokenId = ticket.nft_token_id !== null && 
+                            ticket.nft_token_id !== undefined && 
+                            ticket.nft_token_id !== '' &&
+                            String(ticket.nft_token_id).trim() !== '';
+            
+            console.log(`   ✅ Is registered: ${isRegistered}`);
+            console.log(`   🎯 Has token ID: ${hasTokenId}`);
+            console.log(`   🔄 Will include: ${isRegistered && hasTokenId}`);
+            
+            return isRegistered && hasTokenId;
+        });
 
         let blockchainResults = {
             attempted: blockchainTickets.length,
@@ -213,13 +231,27 @@ export default async function handler(req, res) {
             console.log(`🔗 Attempting to revoke ${blockchainTickets.length} tickets on blockchain...`);
             
             try {
-                // Simple fix - clean string conversion
+                // 🚀 FIXED: Improved token ID cleaning that handles all edge cases
                 const tokenIds = blockchainTickets.map(t => {
-                    const tokenId = String(t.nft_token_id); // ✅ Direct string conversion
-                    console.log('🧹 Clean token ID:', tokenId);
+                    const rawTokenId = t.nft_token_id;
+                    console.log(`🧹 Processing token ID: ${rawTokenId} (type: ${typeof rawTokenId})`);
+                    
+                    // Convert to string and clean
+                    let tokenId = String(rawTokenId).trim();
+                    
+                    // Remove any non-numeric characters (just in case)
+                    tokenId = tokenId.replace(/[^0-9]/g, '');
+                    
+                    // Validate it's a valid number
+                    if (!/^\d+$/.test(tokenId)) {
+                        throw new Error(`Invalid token ID format: ${rawTokenId} -> ${tokenId}`);
+                    }
+                    
+                    console.log(`✅ Clean token ID: ${tokenId}`);
                     return tokenId;
                 });
-                console.log('🎫 Token IDs to revoke:', tokenIds);
+                
+                console.log('🎫 Final token IDs to revoke:', tokenIds);
                 
                 const blockchainResult = await revokeTicketsOnBlockchain(tokenIds);
                 
@@ -285,6 +317,18 @@ export default async function handler(req, res) {
             }
         } else {
             console.log('ℹ️ No blockchain-registered tickets found for revocation');
+            
+            // 🚀 ADDED: Debug information to help identify the issue
+            console.log('🔍 ============ DEBUGGING INFO ============');
+            console.log(`📊 Total tickets to revoke: ${revokedTickets.length}`);
+            revokedTickets.forEach((ticket, index) => {
+                console.log(`🎫 Ticket ${index + 1}:`);
+                console.log(`   🆔 ID: ${ticket.ticket_id}`);
+                console.log(`   ⛓️ Blockchain registered: ${ticket.blockchain_registered}`);
+                console.log(`   🎯 NFT token ID: ${ticket.nft_token_id} (type: ${typeof ticket.nft_token_id})`);
+                console.log(`   📝 Raw: "${ticket.nft_token_id}"`);
+                console.log(`   ✅ Passes filter: ${ticket.blockchain_registered && ticket.nft_token_id !== null && ticket.nft_token_id !== undefined && ticket.nft_token_id !== '' && String(ticket.nft_token_id).trim() !== ''}`);
+            });
         }
 
         console.log('🎉 ============ REVOCATION COMPLETE ============');
