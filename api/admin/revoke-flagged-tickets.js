@@ -127,7 +127,7 @@ export default async function handler(req, res) {
                 is_parent_ticket,
                 parent_ticket_id,
                 nft_contract_address,
-                nft_token_id::text as nft_token_id,
+                nft_token_id::text,
                 nft_mint_status,
                 nft_metadata,
                 blockchain_registered,
