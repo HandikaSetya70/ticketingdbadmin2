@@ -217,7 +217,7 @@ export default async function handler(req, res) {
                 const tokenIds = blockchainTickets.map(t => {
                     const tokenId = String(t.nft_token_id); // ✅ Direct string conversion
                     console.log('🧹 Clean token ID:', cleanTokenId);
-                    return cleanTokenId;
+                    return TokenId;
                 });
                 console.log('🎫 Token IDs to revoke:', tokenIds);
                 
