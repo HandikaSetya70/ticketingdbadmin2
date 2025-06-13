@@ -321,13 +321,13 @@ export default async function handler(req, res) {
     }
 }
 
-// Blockchain revocation function
+
 async function revokeTicketsOnBlockchain(tokenIds) {
     try {
         console.log('🔗 ============ BLOCKCHAIN CONNECTION ============');
         
-        const ethersModule = await import('ethers');
-        const ethers = ethersModule.default || ethersModule;
+        // Use Web3.js instead of ethers
+        const Web3 = (await import('web3')).default;
         
         if (!BLOCKCHAIN_CONFIG.privateKey || !BLOCKCHAIN_CONFIG.rpcUrl) {
             throw new Error('Blockchain configuration missing: privateKey or rpcUrl');
@@ -338,72 +338,103 @@ async function revokeTicketsOnBlockchain(tokenIds) {
         console.log('   📋 Contract:', BLOCKCHAIN_CONFIG.contractAddress);
         console.log(`   🎫 Tokens to revoke: [${tokenIds.join(', ')}]`);
         
-        const provider = new ethers.providers.JsonRpcProvider(BLOCKCHAIN_CONFIG.rpcUrl);
-        const wallet = new ethers.Wallet(BLOCKCHAIN_CONFIG.privateKey, provider);
-        const contract = new ethers.Contract(BLOCKCHAIN_CONFIG.contractAddress, CONTRACT_ABI, wallet);
+        // Initialize Web3 and account
+        const web3 = new Web3(BLOCKCHAIN_CONFIG.rpcUrl);
+        const account = web3.eth.accounts.privateKeyToAccount(BLOCKCHAIN_CONFIG.privateKey);
+        web3.eth.accounts.wallet.add(account);
         
-        console.log('👛 Wallet Address:', wallet.address);
+        console.log('👛 Wallet Address:', account.address);
         
         // Check wallet balance
-        const balance = await wallet.getBalance();
-        const balanceEth = ethers.utils.formatEther(balance);
+        const balance = await web3.eth.getBalance(account.address);
+        const balanceEth = web3.utils.fromWei(balance, 'ether');
         console.log(`💰 Wallet balance: ${balanceEth} ETH`);
         
-        if (balance.lt(ethers.utils.parseEther('0.001'))) {
+        if (parseFloat(balanceEth) < 0.001) {
             throw new Error(`Insufficient gas: ${balanceEth} ETH (minimum 0.001 ETH required)`);
         }
         
-        // Execute revocation transaction
+        // Create contract instance
+        const CONTRACT_ABI_WEB3 = [
+            {
+                "inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
+                "name": "revokeTicket",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            },
+            {
+                "inputs": [{"internalType": "uint256[]", "name": "tokenIds", "type": "uint256[]"}],
+                "name": "batchRevokeTickets", 
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            },
+            {
+                "inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
+                "name": "getTicketStatus",
+                "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ];
+        
+        const contract = new web3.eth.Contract(CONTRACT_ABI_WEB3, BLOCKCHAIN_CONFIG.contractAddress);
+        
+        // Prepare transaction
         console.log('📝 Preparing revocation transaction...');
-        let transaction;
+        let method;
         
         if (tokenIds.length === 1) {
             console.log(`📝 Using single revocation for token: ${tokenIds[0]}`);
-            transaction = await contract.revokeTicket(tokenIds[0]);
+            method = contract.methods.revokeTicket(tokenIds[0]);
         } else {
             console.log(`📝 Using batch revocation for ${tokenIds.length} tokens`);
-            transaction = await contract.batchRevokeTickets(tokenIds);
+            method = contract.methods.batchRevokeTickets(tokenIds);
         }
         
-        console.log(`⏳ Transaction sent: ${transaction.hash}`);
-        console.log('⏱️ Waiting for confirmation...');
+        // Estimate gas
+        const gasEstimate = await method.estimateGas({ from: account.address });
+        const gasPrice = await web3.eth.getGasPrice();
         
-        // Wait for confirmation with timeout
-        const receipt = await Promise.race([
-            transaction.wait(2), // Wait for 2 confirmations
-            new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Transaction timeout after 3 minutes')), 180000)
-            )
-        ]);
+        console.log(`⛽ Gas estimate: ${gasEstimate}`);
+        console.log(`💰 Gas price: ${web3.utils.fromWei(gasPrice, 'gwei')} Gwei`);
+        
+        // Send transaction
+        const transaction = await method.send({
+            from: account.address,
+            gas: Math.floor(gasEstimate * 1.2), // Add 20% buffer
+            gasPrice: gasPrice
+        });
         
         console.log('✅ ============ BLOCKCHAIN SUCCESS ============');
-        console.log('🔗 Transaction Hash:', receipt.transactionHash);
-        console.log('📦 Block Number:', receipt.blockNumber);
-        console.log('⛽ Gas Used:', receipt.gasUsed.toString());
-        console.log('🔴 Status:', receipt.status === 1 ? 'SUCCESS' : 'FAILED');
+        console.log('🔗 Transaction Hash:', transaction.transactionHash);
+        console.log('📦 Block Number:', transaction.blockNumber);
+        console.log('⛽ Gas Used:', transaction.gasUsed);
+        console.log('🔴 Status:', transaction.status ? 'SUCCESS' : 'FAILED');
         
-        if (receipt.status !== 1) {
+        if (!transaction.status) {
             throw new Error('Transaction failed on blockchain');
         }
         
         // Verify revocation for first ticket
         console.log('🔍 Verifying revocation...');
-        const firstTokenStatus = await contract.getTicketStatus(tokenIds[0]);
-        console.log('📊 First token status after revocation:', firstTokenStatus.toString());
+        const firstTokenStatus = await contract.methods.getTicketStatus(tokenIds[0]).call();
+        console.log('📊 First token status after revocation:', firstTokenStatus);
         
-        if (firstTokenStatus.toString() !== '2') { // 2 = REVOKED
+        if (firstTokenStatus !== '2') { // 2 = REVOKED
             console.error('⚠️ Warning: Token status verification failed');
             console.error('   📊 Expected: 2 (REVOKED)');
-            console.error('   📊 Actual:', firstTokenStatus.toString());
+            console.error('   📊 Actual:', firstTokenStatus);
         } else {
             console.log('✅ Revocation verified successfully');
         }
         
         return {
             success: true,
-            transactionHash: transaction.hash,
-            gasUsed: receipt.gasUsed.toString(),
-            blockNumber: receipt.blockNumber,
+            transactionHash: transaction.transactionHash,
+            gasUsed: transaction.gasUsed.toString(),
+            blockNumber: transaction.blockNumber,
             tokensRevoked: tokenIds.length
         };
         
