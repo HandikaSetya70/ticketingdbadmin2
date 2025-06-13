@@ -48,7 +48,7 @@ export default async function handler(req, res) {
         console.log('🔍 Search term:', search || 'None');
         console.log('📈 Sort:', sort_by, sort_order);
 
-        // Build base query with comprehensive joins
+        // Build base query with ONLY existing columns from your schema
         let query = supabase
             .from('tickets')
             .select(`
@@ -60,6 +60,8 @@ export default async function handler(req, res) {
                 ticket_status,
                 blockchain_ticket_id,
                 qr_code_hash,
+                qr_code_data,
+                qr_code_base64,
                 ticket_number,
                 total_tickets_in_group,
                 is_parent_ticket,
@@ -67,10 +69,10 @@ export default async function handler(req, res) {
                 nft_contract_address,
                 nft_token_id,
                 nft_mint_status,
+                nft_metadata,
                 blockchain_registered,
                 blockchain_tx_hash,
                 blockchain_error,
-                created_at,
                 users!inner(
                     user_id, 
                     id_name, 
@@ -107,14 +109,11 @@ export default async function handler(req, res) {
             query = query.eq('user_id', user_id);
         }
 
-        // Apply search filter (search in user name, ticket ID, or event name)
+        // Apply search filter (simplified for now - full-text search would be better)
         if (search) {
-            // Note: This is a simplified search. For better performance, you might want to use full-text search
             query = query.or(`
                 ticket_id.ilike.%${search}%,
-                blockchain_ticket_id.ilike.%${search}%,
-                users.id_name.ilike.%${search}%,
-                events.event_name.ilike.%${search}%
+                blockchain_ticket_id.ilike.%${search}%
             `);
         }
 
@@ -123,19 +122,16 @@ export default async function handler(req, res) {
 
         // Apply sorting
         let orderBy = 'purchase_date';
+        let ascending = sort_order === 'asc';
+        
         switch (sort_by) {
             case 'ticket_number':
                 orderBy = 'ticket_number';
                 break;
-            case 'event_name':
-                orderBy = 'events(event_name)';
-                break;
-            case 'user_name':
-                orderBy = 'users(id_name)';
-                break;
             case 'ticket_status':
                 orderBy = 'ticket_status';
                 break;
+            case 'purchase_date':
             default:
                 orderBy = 'purchase_date';
         }
@@ -146,7 +142,7 @@ export default async function handler(req, res) {
 
         const { data: tickets, error } = await query
             .range(from, to)
-            .order(orderBy, { ascending: sort_order === 'asc' });
+            .order(orderBy, { ascending });
 
         if (error) {
             console.error('❌ Database error:', error);
@@ -157,24 +153,21 @@ export default async function handler(req, res) {
             });
         }
 
-        // Calculate summary statistics
-        const { data: summaryData } = await supabase
-            .rpc('get_ticket_summary', {}) // We'll create this function or calculate manually
-            .single();
-
-        // Manual summary calculation if RPC doesn't exist
-        const { data: allTickets } = await supabase
+        // Calculate summary statistics manually
+        console.log('📊 Calculating ticket statistics...');
+        
+        const { data: allTicketsCount } = await supabase
             .from('tickets')
-            .select('ticket_status, nft_mint_status, blockchain_registered');
+            .select('ticket_status, nft_mint_status, blockchain_registered', { count: 'exact' });
 
         const summary = {
-            total_tickets: allTickets?.length || 0,
-            valid_tickets: allTickets?.filter(t => t.ticket_status === 'valid').length || 0,
-            revoked_tickets: allTickets?.filter(t => t.ticket_status === 'revoked').length || 0,
-            blockchain_registered: allTickets?.filter(t => t.blockchain_registered === true).length || 0,
-            nft_minted: allTickets?.filter(t => t.nft_mint_status === 'minted').length || 0,
-            nft_pending: allTickets?.filter(t => t.nft_mint_status === 'pending').length || 0,
-            nft_failed: allTickets?.filter(t => t.nft_mint_status === 'failed').length || 0
+            total_tickets: allTicketsCount?.length || 0,
+            valid_tickets: allTicketsCount?.filter(t => t.ticket_status === 'valid').length || 0,
+            revoked_tickets: allTicketsCount?.filter(t => t.ticket_status === 'revoked').length || 0,
+            blockchain_registered: allTicketsCount?.filter(t => t.blockchain_registered === true).length || 0,
+            nft_minted: allTicketsCount?.filter(t => t.nft_mint_status === 'minted').length || 0,
+            nft_pending: allTicketsCount?.filter(t => t.nft_mint_status === 'pending').length || 0,
+            nft_failed: allTicketsCount?.filter(t => t.nft_mint_status === 'failed').length || 0
         };
 
         console.log(`✅ Retrieved ${tickets?.length || 0} tickets`);
