@@ -127,7 +127,7 @@ export default async function handler(req, res) {
             console.log('✅ Updated purchase history status to revoked');
         }
 
-        // Add to revocation log for audit trail
+        // 🆕 Add to revocation log for audit trail (with SELECT to get IDs)
         const revocationLogs = revokedTickets.map(ticket => ({
             ticket_id: ticket.ticket_id,
             admin_id: admin_id,
@@ -135,39 +135,65 @@ export default async function handler(req, res) {
             revoked_at: new Date().toISOString()
         }));
 
-        const { error: logError } = await supabase
+        const { data: insertedLogs, error: logError } = await supabase
             .from('revocation_log')
-            .insert(revocationLogs);
+            .insert(revocationLogs)
+            .select('id, ticket_id'); // 🆕 Get the inserted log IDs
 
         if (logError) {
             console.error('⚠️ Warning: Failed to create revocation logs:', logError);
+            // Continue without blockchain queue if revocation log fails
         } else {
-            console.log(`📝 Created ${revocationLogs.length} revocation log entries`);
+            console.log(`📝 Created ${insertedLogs.length} revocation log entries`);
         }
 
-        // Queue blockchain revocations
-        const blockchainQueue = revokedTickets
-            .filter(ticket => ticket.blockchain_registered && ticket.nft_token_id)
-            .map(ticket => ({
-                ticket_id: ticket.ticket_id,
-                revocation_log_id: null, // Will be updated if revocation_log insert succeeds
-                status: 'pending',
-                created_at: new Date().toISOString()
-            }));
+        // 🆕 Queue blockchain revocations (now with proper revocation_log_id links)
+        const blockchainQueueEntries = [];
+        
+        // Only process tickets that have blockchain registration
+        const blockchainTickets = revokedTickets.filter(ticket => 
+            ticket.blockchain_registered && ticket.nft_token_id
+        );
 
-        if (blockchainQueue.length > 0) {
-            const { error: queueError } = await supabase
-                .from('blockchain_revocation_queue')
-                .insert(blockchainQueue);
+        if (blockchainTickets.length > 0 && insertedLogs) {
+            console.log(`⛓️ Preparing ${blockchainTickets.length} tickets for blockchain revocation`);
+            
+            blockchainTickets.forEach(ticket => {
+                // Find the corresponding revocation log entry
+                const logEntry = insertedLogs.find(log => log.ticket_id === ticket.ticket_id);
+                
+                if (logEntry) {
+                    blockchainQueueEntries.push({
+                        ticket_id: ticket.ticket_id,
+                        revocation_log_id: logEntry.id, // 🆕 Proper link to revocation log
+                        status: 'pending',
+                        retry_count: 0,
+                        created_at: new Date().toISOString()
+                    });
+                }
+            });
 
-            if (queueError) {
-                console.error('⚠️ Warning: Failed to queue blockchain revocations:', queueError);
-            } else {
-                console.log(`⛓️ Queued ${blockchainQueue.length} tickets for blockchain revocation`);
+            // Insert blockchain queue entries
+            if (blockchainQueueEntries.length > 0) {
+                const { error: queueError } = await supabase
+                    .from('blockchain_revocation_queue')
+                    .insert(blockchainQueueEntries);
+
+                if (queueError) {
+                    console.error('⚠️ Warning: Failed to queue blockchain revocations:', queueError);
+                } else {
+                    console.log(`⛓️ Successfully queued ${blockchainQueueEntries.length} tickets for blockchain revocation`);
+                }
             }
+        } else {
+            console.log('ℹ️ No blockchain-registered tickets to queue for revocation');
         }
 
         console.log('🎉 ============ REVOCATION COMPLETE ============');
+        console.log(`📊 Summary:`);
+        console.log(`   🎫 Tickets revoked: ${revokedTickets.length}`);
+        console.log(`   📝 Revocation logs created: ${insertedLogs?.length || 0}`);
+        console.log(`   ⛓️ Blockchain revocations queued: ${blockchainQueueEntries.length}`);
 
         return res.status(200).json({
             status: 'success',
@@ -175,7 +201,8 @@ export default async function handler(req, res) {
             data: {
                 revoked_tickets_count: revokedTickets.length,
                 revoked_purchases_count: purchase_ids.length,
-                blockchain_revocations_queued: blockchainQueue.length,
+                revocation_logs_created: insertedLogs?.length || 0,
+                blockchain_revocations_queued: blockchainQueueEntries.length,
                 revoked_ticket_ids: revokedTickets.map(t => t.ticket_id),
                 affected_users: [...new Set(purchases.map(p => p.users.id_name))],
                 total_amount_affected: purchases.reduce((sum, p) => sum + parseFloat(p.payments.amount), 0)
