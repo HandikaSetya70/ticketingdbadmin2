@@ -1,5 +1,4 @@
 import { createClient } from '@supabase/supabase-js';
-import crypto from 'crypto';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
@@ -114,7 +113,7 @@ export default async function handler(req, res) {
             .from('tickets')
             .select('*')
             .in('payment_id', paymentIds)
-            .eq('ticket_status', 'valid');
+            .eq('ticket_status', 'valid'); // Only revoke valid tickets
 
         if (ticketsError) {
             console.error('❌ Failed to retrieve tickets:', ticketsError);
@@ -214,17 +213,13 @@ export default async function handler(req, res) {
             console.log(`🔗 Attempting to revoke ${blockchainTickets.length} tickets on blockchain...`);
             
             try {
-                const tokenIds = blockchainTickets.map(ticket => {
-                // Regenerate the original token ID from ticket_id
-                const originalTokenId = generateTokenId(ticket.ticket_id);
-                console.log(`🔄 Token ID mapping:`);
-                console.log(`   🎫 Ticket ID: ${ticket.ticket_id}`);
-                console.log(`   📊 DB (corrupted): ${ticket.nft_token_id}`);
-                console.log(`   ✅ Regenerated: ${originalTokenId}`);
-                return originalTokenId;
-            });
-
-            console.log('🎯 Final token IDs for revocation:', tokenIds);
+                // Simple fix - clean string conversion
+                const tokenIds = blockchainTickets.map(t => {
+                    const tokenId = String(t.nft_token_id); // ✅ Direct string conversion
+                    console.log('🧹 Clean token ID:', tokenId);
+                    return tokenId;
+                });
+                console.log('🎫 Token IDs to revoke:', tokenIds);
                 
                 const blockchainResult = await revokeTicketsOnBlockchain(tokenIds);
                 
@@ -328,22 +323,6 @@ export default async function handler(req, res) {
             message: 'Internal server error during revocation',
             error: error.message
         });
-    }
-}
-
-function generateTokenId(ticketUuid) {
-    try {
-        console.log('🔢 Regenerating token ID for:', ticketUuid);
-        const hash = crypto.createHash('sha256').update(ticketUuid).digest('hex');
-        const truncatedHash = hash.substring(0, 12); // Use same length as PayPal webhook
-        const tokenId = parseInt(truncatedHash, 16);
-        const tokenIdString = tokenId.toString();
-        console.log('   ✅ Regenerated token ID:', tokenIdString);
-        return tokenIdString;
-    } catch (error) {
-        console.error('❌ Token ID generation failed:', error);
-        const fallbackId = (Date.now() * 1000 + Math.floor(Math.random() * 1000)).toString();
-        return fallbackId;
     }
 }
 
