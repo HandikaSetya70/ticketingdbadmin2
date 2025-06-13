@@ -2,6 +2,22 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
+// Blockchain configuration
+const BLOCKCHAIN_CONFIG = {
+    rpcUrl: process.env.ETHEREUM_RPC_URL || 'https://sepolia.infura.io/v3/' + process.env.INFURA_PROJECT_ID,
+    contractAddress: process.env.REVOCATION_CONTRACT_ADDRESS || '0x86d22947cE0D2908eC0CAC78f7EC405f15cB9e50',
+    privateKey: process.env.ADMIN_PRIVATE_KEY,
+    network: 'sepolia'
+};
+
+// Contract ABI for revocation
+const CONTRACT_ABI = [
+    "function revokeTicket(uint256 tokenId) external",
+    "function batchRevokeTickets(uint256[] calldata tokenIds) external",
+    "function getTicketStatus(uint256 tokenId) external view returns (uint8)",
+    "function isRevoked(uint256 tokenId) external view returns (bool)"
+];
+
 export default async function handler(req, res) {
     // CORS Headers
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -95,7 +111,8 @@ export default async function handler(req, res) {
             });
         }
 
-        // Revoke tickets in database
+        // 1. REVOKE TICKETS IN DATABASE
+        console.log('💾 ============ DATABASE REVOCATION ============');
         const ticketIdsToRevoke = ticketsToRevoke.map(t => t.ticket_id);
         
         const { data: revokedTickets, error: revokeError } = await supabase
@@ -115,7 +132,7 @@ export default async function handler(req, res) {
 
         console.log(`✅ Successfully revoked ${revokedTickets?.length || 0} tickets in database`);
 
-        // Update purchase history status to 'revoked'
+        // 2. UPDATE PURCHASE HISTORY STATUS
         const { error: updateError } = await supabase
             .from('purchase_history')
             .update({ status: 'revoked' })
@@ -127,86 +144,150 @@ export default async function handler(req, res) {
             console.log('✅ Updated purchase history status to revoked');
         }
 
-        // 🆕 Add to revocation log for audit trail (with SELECT to get IDs)
+        // 3. CREATE REVOCATION LOG ENTRIES
+        console.log('📝 ============ CREATING REVOCATION LOGS ============');
         const revocationLogs = revokedTickets.map(ticket => ({
             ticket_id: ticket.ticket_id,
             admin_id: admin_id,
             reason: reason,
-            revoked_at: new Date().toISOString()
+            revoked_at: new Date().toISOString(),
+            blockchain_status: 'pending',
+            blockchain_tx_hash: null,
+            blockchain_error: null
         }));
 
         const { data: insertedLogs, error: logError } = await supabase
             .from('revocation_log')
             .insert(revocationLogs)
-            .select('id, ticket_id'); // 🆕 Get the inserted log IDs
+            .select('id, ticket_id');
 
         if (logError) {
-            console.error('⚠️ Warning: Failed to create revocation logs:', logError);
-            // Continue without blockchain queue if revocation log fails
-        } else {
-            console.log(`📝 Created ${insertedLogs.length} revocation log entries`);
+            console.error('❌ Failed to create revocation logs:', logError);
+            return res.status(500).json({ 
+                status: 'error', 
+                message: 'Failed to create revocation audit logs' 
+            });
         }
 
-        // 🆕 Queue blockchain revocations (now with proper revocation_log_id links)
-        const blockchainQueueEntries = [];
+        console.log(`📝 Created ${insertedLogs.length} revocation log entries`);
+
+        // 4. IMMEDIATE BLOCKCHAIN REVOCATION
+        console.log('⛓️ ============ BLOCKCHAIN REVOCATION ============');
         
-        // Only process tickets that have blockchain registration
+        // Filter tickets that need blockchain revocation
         const blockchainTickets = revokedTickets.filter(ticket => 
             ticket.blockchain_registered && ticket.nft_token_id
         );
 
-        if (blockchainTickets.length > 0 && insertedLogs) {
-            console.log(`⛓️ Preparing ${blockchainTickets.length} tickets for blockchain revocation`);
+        let blockchainResults = {
+            attempted: blockchainTickets.length,
+            successful: 0,
+            failed: 0,
+            transaction_hash: null,
+            gas_used: null,
+            errors: []
+        };
+
+        if (blockchainTickets.length > 0) {
+            console.log(`🔗 Attempting to revoke ${blockchainTickets.length} tickets on blockchain...`);
             
-            blockchainTickets.forEach(ticket => {
-                // Find the corresponding revocation log entry
-                const logEntry = insertedLogs.find(log => log.ticket_id === ticket.ticket_id);
+            try {
+                const tokenIds = blockchainTickets.map(t => t.nft_token_id);
+                console.log('🎫 Token IDs to revoke:', tokenIds);
                 
-                if (logEntry) {
-                    blockchainQueueEntries.push({
-                        ticket_id: ticket.ticket_id,
-                        revocation_log_id: logEntry.id, // 🆕 Proper link to revocation log
-                        status: 'pending',
-                        retry_count: 0,
-                        created_at: new Date().toISOString()
-                    });
-                }
-            });
-
-            // Insert blockchain queue entries
-            if (blockchainQueueEntries.length > 0) {
-                const { error: queueError } = await supabase
-                    .from('blockchain_revocation_queue')
-                    .insert(blockchainQueueEntries);
-
-                if (queueError) {
-                    console.error('⚠️ Warning: Failed to queue blockchain revocations:', queueError);
+                const blockchainResult = await revokeTicketsOnBlockchain(tokenIds);
+                
+                if (blockchainResult.success) {
+                    blockchainResults.successful = blockchainTickets.length;
+                    blockchainResults.transaction_hash = blockchainResult.transactionHash;
+                    blockchainResults.gas_used = blockchainResult.gasUsed;
+                    
+                    console.log(`✅ Successfully revoked ${blockchainTickets.length} tickets on blockchain`);
+                    console.log(`   🔗 Transaction Hash: ${blockchainResult.transactionHash}`);
+                    console.log(`   ⛽ Gas Used: ${blockchainResult.gasUsed}`);
+                    
+                    // Update revocation logs with blockchain success
+                    const blockchainTicketIds = blockchainTickets.map(t => t.ticket_id);
+                    await supabase
+                        .from('revocation_log')
+                        .update({ 
+                            blockchain_status: 'completed',
+                            blockchain_tx_hash: blockchainResult.transactionHash
+                        })
+                        .in('ticket_id', blockchainTicketIds);
+                        
+                    // Update tickets with blockchain transaction hash
+                    await supabase
+                        .from('tickets')
+                        .update({ 
+                            blockchain_tx_hash: blockchainResult.transactionHash 
+                        })
+                        .in('ticket_id', blockchainTicketIds);
+                        
                 } else {
-                    console.log(`⛓️ Successfully queued ${blockchainQueueEntries.length} tickets for blockchain revocation`);
+                    blockchainResults.failed = blockchainTickets.length;
+                    blockchainResults.errors.push(blockchainResult.error);
+                    
+                    console.error(`❌ Failed to revoke tickets on blockchain: ${blockchainResult.error}`);
+                    
+                    // Update revocation logs with blockchain failure
+                    const blockchainTicketIds = blockchainTickets.map(t => t.ticket_id);
+                    await supabase
+                        .from('revocation_log')
+                        .update({ 
+                            blockchain_status: 'failed',
+                            blockchain_error: blockchainResult.error
+                        })
+                        .in('ticket_id', blockchainTicketIds);
                 }
+                
+            } catch (error) {
+                blockchainResults.failed = blockchainTickets.length;
+                blockchainResults.errors.push(error.message);
+                
+                console.error(`❌ Blockchain revocation exception: ${error.message}`);
+                
+                // Update revocation logs with error
+                const blockchainTicketIds = blockchainTickets.map(t => t.ticket_id);
+                await supabase
+                    .from('revocation_log')
+                    .update({ 
+                        blockchain_status: 'failed',
+                        blockchain_error: error.message
+                    })
+                    .in('ticket_id', blockchainTicketIds);
             }
         } else {
-            console.log('ℹ️ No blockchain-registered tickets to queue for revocation');
+            console.log('ℹ️ No blockchain-registered tickets found for revocation');
         }
 
         console.log('🎉 ============ REVOCATION COMPLETE ============');
         console.log(`📊 Summary:`);
-        console.log(`   🎫 Tickets revoked: ${revokedTickets.length}`);
-        console.log(`   📝 Revocation logs created: ${insertedLogs?.length || 0}`);
-        console.log(`   ⛓️ Blockchain revocations queued: ${blockchainQueueEntries.length}`);
+        console.log(`   🎫 Total tickets revoked: ${revokedTickets.length}`);
+        console.log(`   📝 Revocation logs created: ${insertedLogs.length}`);
+        console.log(`   ⛓️ Blockchain attempts: ${blockchainResults.attempted}`);
+        console.log(`   ✅ Blockchain successful: ${blockchainResults.successful}`);
+        console.log(`   ❌ Blockchain failed: ${blockchainResults.failed}`);
+
+        const isPartialSuccess = blockchainResults.failed > 0 && blockchainResults.successful > 0;
+        const responseStatus = blockchainResults.failed === 0 ? 'success' : 
+                              blockchainResults.successful === 0 ? 'partial_success' : 'partial_success';
 
         return res.status(200).json({
-            status: 'success',
+            status: responseStatus,
             message: `Successfully revoked ${revokedTickets.length} tickets from ${purchases.length} flagged purchases`,
             data: {
                 revoked_tickets_count: revokedTickets.length,
                 revoked_purchases_count: purchase_ids.length,
-                revocation_logs_created: insertedLogs?.length || 0,
-                blockchain_revocations_queued: blockchainQueueEntries.length,
+                revocation_logs_created: insertedLogs.length,
+                blockchain_revocation: blockchainResults,
                 revoked_ticket_ids: revokedTickets.map(t => t.ticket_id),
                 affected_users: [...new Set(purchases.map(p => p.users.id_name))],
                 total_amount_affected: purchases.reduce((sum, p) => sum + parseFloat(p.payments.amount), 0)
-            }
+            },
+            warnings: blockchainResults.errors.length > 0 ? [
+                `Blockchain revocation failed for ${blockchainResults.failed} tickets: ${blockchainResults.errors.join(', ')}`
+            ] : []
         });
 
     } catch (error) {
@@ -216,5 +297,104 @@ export default async function handler(req, res) {
             message: 'Internal server error during revocation',
             error: error.message
         });
+    }
+}
+
+// Blockchain revocation function
+async function revokeTicketsOnBlockchain(tokenIds) {
+    try {
+        console.log('🔗 ============ BLOCKCHAIN CONNECTION ============');
+        
+        const ethersModule = await import('ethers');
+        const ethers = ethersModule.default || ethersModule;
+        
+        if (!BLOCKCHAIN_CONFIG.privateKey || !BLOCKCHAIN_CONFIG.rpcUrl) {
+            throw new Error('Blockchain configuration missing: privateKey or rpcUrl');
+        }
+
+        console.log('🌐 Connecting to blockchain...');
+        console.log('   🌐 RPC URL:', BLOCKCHAIN_CONFIG.rpcUrl);
+        console.log('   📋 Contract:', BLOCKCHAIN_CONFIG.contractAddress);
+        console.log(`   🎫 Tokens to revoke: [${tokenIds.join(', ')}]`);
+        
+        const provider = new ethers.providers.JsonRpcProvider(BLOCKCHAIN_CONFIG.rpcUrl);
+        const wallet = new ethers.Wallet(BLOCKCHAIN_CONFIG.privateKey, provider);
+        const contract = new ethers.Contract(BLOCKCHAIN_CONFIG.contractAddress, CONTRACT_ABI, wallet);
+        
+        console.log('👛 Wallet Address:', wallet.address);
+        
+        // Check wallet balance
+        const balance = await wallet.getBalance();
+        const balanceEth = ethers.utils.formatEther(balance);
+        console.log(`💰 Wallet balance: ${balanceEth} ETH`);
+        
+        if (balance.lt(ethers.utils.parseEther('0.001'))) {
+            throw new Error(`Insufficient gas: ${balanceEth} ETH (minimum 0.001 ETH required)`);
+        }
+        
+        // Execute revocation transaction
+        console.log('📝 Preparing revocation transaction...');
+        let transaction;
+        
+        if (tokenIds.length === 1) {
+            console.log(`📝 Using single revocation for token: ${tokenIds[0]}`);
+            transaction = await contract.revokeTicket(tokenIds[0]);
+        } else {
+            console.log(`📝 Using batch revocation for ${tokenIds.length} tokens`);
+            transaction = await contract.batchRevokeTickets(tokenIds);
+        }
+        
+        console.log(`⏳ Transaction sent: ${transaction.hash}`);
+        console.log('⏱️ Waiting for confirmation...');
+        
+        // Wait for confirmation with timeout
+        const receipt = await Promise.race([
+            transaction.wait(2), // Wait for 2 confirmations
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Transaction timeout after 3 minutes')), 180000)
+            )
+        ]);
+        
+        console.log('✅ ============ BLOCKCHAIN SUCCESS ============');
+        console.log('🔗 Transaction Hash:', receipt.transactionHash);
+        console.log('📦 Block Number:', receipt.blockNumber);
+        console.log('⛽ Gas Used:', receipt.gasUsed.toString());
+        console.log('🔴 Status:', receipt.status === 1 ? 'SUCCESS' : 'FAILED');
+        
+        if (receipt.status !== 1) {
+            throw new Error('Transaction failed on blockchain');
+        }
+        
+        // Verify revocation for first ticket
+        console.log('🔍 Verifying revocation...');
+        const firstTokenStatus = await contract.getTicketStatus(tokenIds[0]);
+        console.log('📊 First token status after revocation:', firstTokenStatus.toString());
+        
+        if (firstTokenStatus.toString() !== '2') { // 2 = REVOKED
+            console.error('⚠️ Warning: Token status verification failed');
+            console.error('   📊 Expected: 2 (REVOKED)');
+            console.error('   📊 Actual:', firstTokenStatus.toString());
+        } else {
+            console.log('✅ Revocation verified successfully');
+        }
+        
+        return {
+            success: true,
+            transactionHash: transaction.hash,
+            gasUsed: receipt.gasUsed.toString(),
+            blockNumber: receipt.blockNumber,
+            tokensRevoked: tokenIds.length
+        };
+        
+    } catch (error) {
+        console.error('🔥 ============ BLOCKCHAIN FAILURE ============');
+        console.error('❌ Error message:', error.message);
+        console.error('📊 Error type:', error.code || 'Unknown');
+        
+        return {
+            success: false,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        };
     }
 }
